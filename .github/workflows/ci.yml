@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: Syntax check every Lua file
+        run: |
+          for f in $(git ls-files '*.lua'); do
+            luajit -bl "$f" > /dev/null || { echo "syntax error in $f"; exit 1; }
+          done
+      - name: Run tests
+        run: luajit tests/run.lua
+      - name: Check the committed bundle is up to date
+        run: luajit tools/bundle.lua --check
