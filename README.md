@@ -24,6 +24,10 @@ Big shout-out to [BlankSourceCode](https://github.com/BlankSourceCode): their or
 
 ## Demo
 
+▶️ **[Watch the full video on YouTube](https://www.youtube.com/watch?v=WoDHnBz0CFU)**
+
+[![OBSCineZoom video on YouTube](https://img.youtube.com/vi/WoDHnBz0CFU/hqdefault.jpg)](https://www.youtube.com/watch?v=WoDHnBz0CFU)
+
 **Auto-zoom on click, with click ripple and click sound**: set up in the script panel, then
 clicking zooms in and the view follows the mouse.
 
