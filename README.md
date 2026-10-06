@@ -3,6 +3,12 @@
 An OBS Studio Lua script that zooms a display capture and follows your mouse, with smooth
 spring motion and optional auto-zoom on clicks, in the spirit of Screen Studio.
 
+<p align="center">
+  <a href="https://github.com/raulpetruta/obs-cine-zoom/releases/latest/download/cinezoom.lua">
+    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20Script-cinezoom.lua-4C8DFF?style=for-the-badge" height="50" alt="Download Script">
+  </a>
+</p>
+
 > [!NOTE]
 > **Built entirely with AI.** OBSCineZoom was "vibe coded": Claude Opus 5.5 planned it and
 > Claude Sonnet 5.5 wrote the code, with me testing it in OBS and steering. It has a test suite,
@@ -41,7 +47,7 @@ clicking zooms in and the view follows the mouse.
 
 ## Install
 
-1. Download `cinezoom.lua` (it is a single self-contained file).
+1. [Download `cinezoom.lua`](https://github.com/raulpetruta/obs-cine-zoom/releases/latest/download/cinezoom.lua) (it is a single self-contained file).
 2. In OBS: **Tools > Scripts > +** and pick `cinezoom.lua`.
 3. Open **Settings > Hotkeys** and bind the three "OBSCineZoom" actions.
 

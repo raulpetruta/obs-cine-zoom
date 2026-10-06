@@ -1,0 +1,37 @@
+name: release
+
+# Push a tag like v0.1.0 to publish a GitHub Release with cinezoom.lua attached.
+# The README download button points at releases/latest/download/cinezoom.lua.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: Run tests
+        run: luajit tests/run.lua
+      - name: Check the committed bundle is up to date
+        run: luajit tools/bundle.lua --check
+      - name: Check the tag matches the script version
+        run: |
+          version=$(sed -n 's/^M.VERSION = "\(.*\)"/\1/p' src/cinezoom/main.lua)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match M.VERSION ($version) in src/cinezoom/main.lua"
+            exit 1
+          fi
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" cinezoom.lua \
+            --title "OBSCineZoom $GITHUB_REF_NAME" \
+            --generate-notes
