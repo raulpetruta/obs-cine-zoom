@@ -225,8 +225,9 @@ Edit modules under `src/cinezoom/`, never `cinezoom.lua` directly.
 ## Credits and license
 
 MIT, see [LICENSE](LICENSE). Based on
-[obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse) by BlankSourceCode (MIT);
-the scene item and crop filter handling is ported from it.
+[obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse) by BlankSourceCode, which is
+also MIT licensed; the scene item and crop filter handling is ported from it. Its copyright notice is
+kept in [LICENSE](LICENSE) as the MIT license requires.
 
 ## Support the project
 
