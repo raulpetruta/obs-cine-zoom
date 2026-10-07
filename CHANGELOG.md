@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0
+
+### Added
+- Studio look (off until you press **Apply studio look**): builds the saved scenes
+  "OBSCineZoom Studio" and "OBSCineZoom Studio Frame" with a gradient, solid colour or image background,
+  padding, rounded corners (`mask_filter_v2` on the frame scene) and a soft drop shadow, without touching
+  your own scene. Settings update live, **Remove studio look** deletes what was created, and missing
+  generated images are rebuilt at load. Diagnose has a Studio section. Confirmed on macOS (OBS 33 beta).
+
+### Fixed
+- Switching the background between Gradient and Solid colour could leave a second background item on
+  top of the picture, hiding the screen. The background is now always one image source (a solid colour
+  is a small generated image), and leftover copies are removed.
+
+## 0.1.0
+
 
 First OBSCineZoom release, a rewrite of obs-zoom-to-mouse 1.0.2 aimed at macOS with OBS 30 to 32.
 **Not yet verified on a Mac**: see the checklist in the README.
@@ -31,5 +46,5 @@ First OBSCineZoom release, a rewrite of obs-zoom-to-mouse 1.0.2 aimed at macOS w
 - Optional click effects, both off by default: a click sound (generated, or your own file) mixed into
   the recording and stream, and a click ripple that follows the zoomed view. Both are private OBS
   objects removed on scene change, scene collection change and unload. Diagnose has a Click effects
-  section. **Not yet verified on a Mac.**
+  section.
 - Test suite (`luajit tests/run.lua`), single-file bundle (`tools/bundle.lua`), CI.

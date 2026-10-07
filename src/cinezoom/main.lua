@@ -13,13 +13,14 @@ local sources = require("cinezoom.obs.sources")
 local sceneitem = require("cinezoom.obs.sceneitem")
 local opt = require("cinezoom.obs.opt")
 local fx_mod = require("cinezoom.effects")
+local studio_mod = require("cinezoom.studio")
 local settings_mod = require("cinezoom.settings")
 local remote_mod = require("cinezoom.remote")
 local diagnose = require("cinezoom.diagnose")
 
 local M = {}
 
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 local HOTKEY_KEYS = {
     zoom = "cinezoom.hotkey.zoom",
@@ -44,6 +45,8 @@ Follow: Auto follow starts tracking when you zoom in; the Deadzone is the area a
   view center where the mouse can move without the view following.
 Auto-zoom: zoom in on clicks, zoom out after a pause. Typing and fast mouse movement are optional.
 Click effects (off by default): a click sound and a click ripple. "Test click effects" tries them.
+Studio look (off until you press Apply studio look): an inset, rounded, shadowed picture on a background,
+  in its own scenes. Your own scene is not changed; Remove studio look deletes them again.
 Manual source position: override the display position/size (mouse units) when it cannot be found.
 Diagnose: log everything needed for a bug report, then probe the mouse for 5 seconds.
 ]]
@@ -66,6 +69,7 @@ function M.install(env)
     local fx = fx_mod.new()      -- click effects (nothing is created until one is switched on)
     local fx_proj = nil          -- {mx, my, inside} of the current tick, nil if there was no projection
     local fx_errors = 0          -- consecutive fx_tick failures
+    local studio = studio_mod.new() -- the studio scenes (nothing is created until "Apply studio look")
 
     local display, display_note = nil, "not resolved yet"
     local clock = 0
@@ -170,7 +174,7 @@ function M.install(env)
     local function diagnose_context()
         return {
             version = M.VERSION, obs_version = obs_version, backend = backend, si = si,
-            display = display, display_note = display_note, sample = sample, fx = fx,
+            display = display, display_note = display_note, sample = sample, fx = fx, studio = studio,
             state = { zoomed = zoomed, following = following, auto = az.enabled },
         }
     end
@@ -257,6 +261,7 @@ function M.install(env)
         if si:poll_size() then
             resolve_display()
             reset_zoom()
+            pcall(studio.on_source_resized, studio, si)
         end
         if not si.ready then
             return
@@ -336,11 +341,28 @@ function M.install(env)
         end
     end
 
+    -- Studio look changes and layout fixes. An error here never reaches the zoom: sync_safe logs it.
+    local function studio_tick()
+        local ok, err = pcall(studio.tick, studio, clock, si)
+        if not ok then
+            log.warn("Studio look error: %s", tostring(err))
+        end
+    end
+
     local function tick(seconds)
         zoom_tick(seconds)
         if script_loaded and backend ~= nil then
             run_fx(seconds)
+            studio_tick()
         end
+    end
+
+    -- What the studio needs from the zoom side
+    local function studio_context()
+        return {
+            si = si, fx = fx, attach = attach,
+            is_capture = function(src) return sources.is_capture(obs.obs_source_get_id(src), OS()) end,
+        }
     end
 
     ----------------------------------------------------------------------
@@ -364,8 +386,10 @@ function M.install(env)
             or EVENT_EXIT ~= nil and event == EVENT_EXIT then
             -- Nothing of ours may be left in scenes that are about to go away
             fx:on_collection_changing()
+            pcall(studio.on_collection_changing, studio)
         elseif EVENT_COLLECTION_CHANGED ~= nil and event == EVENT_COLLECTION_CHANGED then
             pcall(fx.on_collection_changed, fx)
+            pcall(studio.repair, studio, cfg, si)
         elseif event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
             log.debug("OBS Scene changed")
             -- Scene change can happen before OBS has completely loaded
@@ -376,6 +400,7 @@ function M.install(env)
             log.debug("OBS Loaded")
             obs_loaded = true
             attach()
+            pcall(studio.repair, studio, cfg, si)
         elseif event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
             log.debug("OBS Shutting down")
             -- Fail-safe for unloading the script during shutdown
@@ -408,6 +433,18 @@ function M.install(env)
             end,
             on_help = function()
                 log.info(string.format(HELP, M.VERSION))
+            end,
+            on_studio_apply = function()
+                local ok, res = pcall(studio.apply, studio, cfg, studio_context())
+                if not ok then
+                    log.error("Studio look failed: %s", tostring(res))
+                end
+            end,
+            on_studio_remove = function()
+                local ok, res = pcall(studio.remove, studio, studio_context())
+                if not ok then
+                    log.error("Studio look could not be removed: %s", tostring(res))
+                end
             end,
             on_fx_test = function()
                 local s = sample()
@@ -466,6 +503,9 @@ function M.install(env)
 
         cfg.source = "" -- script_update sets it, which triggers the first attach
         script_loaded = true
+        if obs_loaded then
+            pcall(studio.repair, studio, cfg, si) -- images that went missing while the script was off
+        end
     end
 
     function env.script_update(settings)
@@ -480,6 +520,8 @@ function M.install(env)
         elseif settings_mod.override_changed(old.override, cfg.override) and obs_loaded then
             resolve_display()
         end
+
+        pcall(studio.on_settings, studio, cfg.studio, clock)
 
         local okfx, errfx = pcall(fx.configure, fx, cfg.fx)
         if not okfx then

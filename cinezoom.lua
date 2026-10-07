@@ -139,6 +139,177 @@ end
 return M
 end
 
+package.preload["cinezoom.assets.raster"] = function(...)
+-- Studio images as RGBA strings (straight alpha, w*h*4 bytes) for png.encode: the background
+-- gradient, the rounded-corner mask and the soft shadow. Pure Lua; the work is done per row into a
+-- table of strings, never by concatenating per pixel, because this runs inside OBS.
+local M = {}
+
+local char, floor, sqrt = string.char, math.floor, math.sqrt
+local concat = table.concat
+
+local function clamp(v, lo, hi)
+    return v < lo and lo or (v > hi and hi or v)
+end
+
+-- 0xAABBGGRR (what OBS colour properties store) -> r, g, b
+local function unpack_color(c)
+    return c % 256, floor(c / 256) % 256, floor(c / 65536) % 256
+end
+
+-- 4x4 ordered-dither thresholds in (0, 1), mean 0.5, so floor(v + threshold) rounds without banding
+local BAYER = {
+    { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 },
+}
+
+---
+-- Linear gradient from c1 to c2. Angle 0 runs left to right, 90 top to bottom (y points down).
+-- The ramp spans the projection of the four corners, so both colours are reached at the corners.
+---@param w number
+---@param h number
+---@param c1 number Start colour, 0xAABBGGRR
+---@param c2 number End colour, 0xAABBGGRR
+---@param angle_deg number
+---@return string rgba
+function M.gradient_rgba(w, h, c1, c2, angle_deg)
+    local r1, g1, b1 = unpack_color(c1)
+    local r2, g2, b2 = unpack_color(c2)
+    local a = math.rad(angle_deg)
+    local dx, dy = math.cos(a), math.sin(a)
+    local lo, hi = math.huge, -math.huge
+    for _, p in ipairs({ { 0, 0 }, { w, 0 }, { 0, h }, { w, h } }) do
+        local v = p[1] * dx + p[2] * dy
+        lo, hi = math.min(lo, v), math.max(hi, v)
+    end
+    local span = hi - lo
+    if span < 1e-9 then span = 1 end
+
+    local rows = {}
+    for y = 0, h - 1 do
+        local row = {}
+        local brow = BAYER[y % 4 + 1]
+        for x = 0, w - 1 do
+            local t = clamp(((x + 0.5) * dx + (y + 0.5) * dy - lo) / span, 0, 1)
+            local th = (brow[x % 4 + 1] + 0.5) / 16
+            row[x + 1] = char(
+                clamp(floor(r1 + (r2 - r1) * t + th), 0, 255),
+                clamp(floor(g1 + (g2 - g1) * t + th), 0, 255),
+                clamp(floor(b1 + (b2 - b1) * t + th), 0, 255), 255)
+        end
+        rows[y + 1] = concat(row)
+    end
+    return concat(rows)
+end
+
+-- Anti-aliased coverage (0..1) of a rounded rect at pixel centre (px, py), from its signed distance
+local function rounded_cover(px, py, cx, cy, hx, hy, r)
+    local qx = math.abs(px - cx) - (hx - r)
+    local qy = math.abs(py - cy) - (hy - r)
+    local mx, my = qx > 0 and qx or 0, qy > 0 and qy or 0
+    local d = sqrt(mx * mx + my * my) + math.min(math.max(qx, qy), 0) - r
+    return clamp(0.5 - d, 0, 1)
+end
+
+---
+-- Mask for mask_filter: white and opaque inside the rounded rect, black and transparent outside.
+-- RGB equals alpha everywhere, so it works whether the mask type reads the colour or the alpha.
+---@param w number Image size
+---@param h number
+---@param rect table {x, y, w, h} of the rounded rect in image pixels
+---@param r number Corner radius in image pixels
+---@return string rgba
+function M.rounded_mask_rgba(w, h, rect, r)
+    local px = {}
+    for v = 0, 255 do
+        px[v] = char(v, v, v, v)
+    end
+    local cx, cy = rect.x + rect.w / 2, rect.y + rect.h / 2
+    local hx, hy = rect.w / 2, rect.h / 2
+    r = clamp(r, 0, math.min(hx, hy))
+
+    local rows = {}
+    for y = 0, h - 1 do
+        local row = {}
+        for x = 0, w - 1 do
+            row[x + 1] = px[floor(rounded_cover(x + 0.5, y + 0.5, cx, cy, hx, hy, r) * 255 + 0.5)]
+        end
+        rows[y + 1] = concat(row)
+    end
+    return concat(rows)
+end
+
+-- One box blur pass along a line of n values (clamped to 0 outside), radius k, running sum
+local function blur_line(src, dst, n, k)
+    local win = 2 * k + 1
+    local sum = 0
+    for i = 1, k + 1 do
+        sum = sum + (src[i] or 0)
+    end
+    for i = 1, n do
+        dst[i] = sum / win
+        local add, sub = i + k + 1, i - k
+        if add <= n then sum = sum + src[add] end
+        if sub >= 1 then sum = sum - src[sub] end
+    end
+end
+
+---
+-- Soft shadow: the rounded rect of spec.inner blurred with three box passes (close to a Gaussian).
+---@param spec table From layout.shadow_spec: {w, h, inner = {x, y, w, h}, r, box}
+---@param opacity number 0..1
+---@param rgb table|nil {r, g, b}, black by default
+---@return string rgba
+function M.shadow_rgba(spec, opacity, rgb)
+    local w, h = spec.w, spec.h
+    local inner = spec.inner
+    local cx, cy = inner.x + inner.w / 2, inner.y + inner.h / 2
+    local hx, hy = inner.w / 2, inner.h / 2
+    local r = clamp(spec.r, 0, math.min(hx, hy))
+
+    local rows = {}
+    for y = 1, h do
+        local row = {}
+        for x = 1, w do
+            row[x] = rounded_cover(x - 0.5, y - 0.5, cx, cy, hx, hy, r)
+        end
+        rows[y] = row
+    end
+
+    local k = spec.box
+    local tmp = {}
+    for _ = 1, 3 do
+        for y = 1, h do
+            blur_line(rows[y], tmp, w, k)
+            rows[y], tmp = tmp, rows[y]
+        end
+        local col, out = {}, {}
+        for x = 1, w do
+            for y = 1, h do col[y] = rows[y][x] end
+            blur_line(col, out, h, k)
+            for y = 1, h do rows[y][x] = out[y] end
+        end
+    end
+
+    rgb = rgb or { 0, 0, 0 }
+    local prefix = char(rgb[1], rgb[2], rgb[3])
+    local alpha = {}
+    for i = 0, 255 do
+        alpha[i] = prefix .. char(i)
+    end
+    local out = {}
+    for y = 1, h do
+        local row, line = rows[y], {}
+        for x = 1, w do
+            line[x] = alpha[clamp(floor(row[x] * opacity * 255 + 0.5), 0, 255)]
+        end
+        out[y] = concat(line)
+    end
+    return concat(out)
+end
+
+return M
+end
+
 package.preload["cinezoom.assets.wav"] = function(...)
 -- Mono 16-bit PCM WAV writer and the synthesized click sound.
 local M = {}
@@ -475,7 +646,7 @@ end
 
 package.preload["cinezoom.diagnose"] = function(...)
 -- Diagnose: everything needed to debug a report, always logged (not gated by Debug).
--- Sections: Environment, Backend, Source, Displays, Live, Click effects, then a 5 second live probe.
+-- Sections: Environment, Backend, Source, Displays, Live, Click effects, Studio, then a 5 second live probe.
 local obs = obslua
 local log = require("cinezoom.log")
 local version = require("cinezoom.version")
@@ -589,6 +760,22 @@ local function fx_section(ctx, lines)
     end
 end
 
+local function studio_section(ctx, lines)
+    lines[#lines + 1] = "== Studio =="
+    if ctx.studio == nil then
+        lines[#lines + 1] = "not available"
+        return
+    end
+    local ok, studio_lines = pcall(ctx.studio.describe, ctx.studio, ctx.si)
+    if not ok then
+        lines[#lines + 1] = "could not describe the studio: " .. tostring(studio_lines)
+        return
+    end
+    for _, l in ipairs(studio_lines) do
+        lines[#lines + 1] = l
+    end
+end
+
 ---
 -- Build the report
 ---@param ctx table See main.lua (diagnose_context)
@@ -601,6 +788,7 @@ function M.report(ctx)
     displays_section(ctx, lines)
     live_section(ctx, lines)
     fx_section(ctx, lines)
+    studio_section(ctx, lines)
     return lines
 end
 
@@ -2061,13 +2249,14 @@ local sources = require("cinezoom.obs.sources")
 local sceneitem = require("cinezoom.obs.sceneitem")
 local opt = require("cinezoom.obs.opt")
 local fx_mod = require("cinezoom.effects")
+local studio_mod = require("cinezoom.studio")
 local settings_mod = require("cinezoom.settings")
 local remote_mod = require("cinezoom.remote")
 local diagnose = require("cinezoom.diagnose")
 
 local M = {}
 
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 local HOTKEY_KEYS = {
     zoom = "cinezoom.hotkey.zoom",
@@ -2092,6 +2281,8 @@ Follow: Auto follow starts tracking when you zoom in; the Deadzone is the area a
   view center where the mouse can move without the view following.
 Auto-zoom: zoom in on clicks, zoom out after a pause. Typing and fast mouse movement are optional.
 Click effects (off by default): a click sound and a click ripple. "Test click effects" tries them.
+Studio look (off until you press Apply studio look): an inset, rounded, shadowed picture on a background,
+  in its own scenes. Your own scene is not changed; Remove studio look deletes them again.
 Manual source position: override the display position/size (mouse units) when it cannot be found.
 Diagnose: log everything needed for a bug report, then probe the mouse for 5 seconds.
 ]]
@@ -2114,6 +2305,7 @@ function M.install(env)
     local fx = fx_mod.new()      -- click effects (nothing is created until one is switched on)
     local fx_proj = nil          -- {mx, my, inside} of the current tick, nil if there was no projection
     local fx_errors = 0          -- consecutive fx_tick failures
+    local studio = studio_mod.new() -- the studio scenes (nothing is created until "Apply studio look")
 
     local display, display_note = nil, "not resolved yet"
     local clock = 0
@@ -2218,7 +2410,7 @@ function M.install(env)
     local function diagnose_context()
         return {
             version = M.VERSION, obs_version = obs_version, backend = backend, si = si,
-            display = display, display_note = display_note, sample = sample, fx = fx,
+            display = display, display_note = display_note, sample = sample, fx = fx, studio = studio,
             state = { zoomed = zoomed, following = following, auto = az.enabled },
         }
     end
@@ -2305,6 +2497,7 @@ function M.install(env)
         if si:poll_size() then
             resolve_display()
             reset_zoom()
+            pcall(studio.on_source_resized, studio, si)
         end
         if not si.ready then
             return
@@ -2384,11 +2577,28 @@ function M.install(env)
         end
     end
 
+    -- Studio look changes and layout fixes. An error here never reaches the zoom: sync_safe logs it.
+    local function studio_tick()
+        local ok, err = pcall(studio.tick, studio, clock, si)
+        if not ok then
+            log.warn("Studio look error: %s", tostring(err))
+        end
+    end
+
     local function tick(seconds)
         zoom_tick(seconds)
         if script_loaded and backend ~= nil then
             run_fx(seconds)
+            studio_tick()
         end
+    end
+
+    -- What the studio needs from the zoom side
+    local function studio_context()
+        return {
+            si = si, fx = fx, attach = attach,
+            is_capture = function(src) return sources.is_capture(obs.obs_source_get_id(src), OS()) end,
+        }
     end
 
     ----------------------------------------------------------------------
@@ -2412,8 +2622,10 @@ function M.install(env)
             or EVENT_EXIT ~= nil and event == EVENT_EXIT then
             -- Nothing of ours may be left in scenes that are about to go away
             fx:on_collection_changing()
+            pcall(studio.on_collection_changing, studio)
         elseif EVENT_COLLECTION_CHANGED ~= nil and event == EVENT_COLLECTION_CHANGED then
             pcall(fx.on_collection_changed, fx)
+            pcall(studio.repair, studio, cfg, si)
         elseif event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
             log.debug("OBS Scene changed")
             -- Scene change can happen before OBS has completely loaded
@@ -2424,6 +2636,7 @@ function M.install(env)
             log.debug("OBS Loaded")
             obs_loaded = true
             attach()
+            pcall(studio.repair, studio, cfg, si)
         elseif event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
             log.debug("OBS Shutting down")
             -- Fail-safe for unloading the script during shutdown
@@ -2456,6 +2669,18 @@ function M.install(env)
             end,
             on_help = function()
                 log.info(string.format(HELP, M.VERSION))
+            end,
+            on_studio_apply = function()
+                local ok, res = pcall(studio.apply, studio, cfg, studio_context())
+                if not ok then
+                    log.error("Studio look failed: %s", tostring(res))
+                end
+            end,
+            on_studio_remove = function()
+                local ok, res = pcall(studio.remove, studio, studio_context())
+                if not ok then
+                    log.error("Studio look could not be removed: %s", tostring(res))
+                end
             end,
             on_fx_test = function()
                 local s = sample()
@@ -2514,6 +2739,9 @@ function M.install(env)
 
         cfg.source = "" -- script_update sets it, which triggers the first attach
         script_loaded = true
+        if obs_loaded then
+            pcall(studio.repair, studio, cfg, si) -- images that went missing while the script was off
+        end
     end
 
     function env.script_update(settings)
@@ -2528,6 +2756,8 @@ function M.install(env)
         elseif settings_mod.override_changed(old.override, cfg.override) and obs_loaded then
             resolve_display()
         end
+
+        pcall(studio.on_settings, studio, cfg.studio, clock)
 
         local okfx, errfx = pcall(fx.configure, fx, cfg.fx)
         if not okfx then
@@ -4085,6 +4315,7 @@ package.preload["cinezoom.settings"] = function(...)
 -- Settings: defaults, reading them into a plain table, and the properties (UI) panel.
 local obs = obslua
 local camera = require("cinezoom.camera")
+local geometry = require("cinezoom.geometry")
 local sources = require("cinezoom.obs.sources")
 local remote = require("cinezoom.remote")
 
@@ -4134,6 +4365,19 @@ function M.defaults(s)
     obs.obs_data_set_default_string(s, "fx_ripple_file", "")
     obs.obs_data_set_default_bool(s, "fx_only_inside", true)
     obs.obs_data_set_default_bool(s, "fx_only_zoomed", false)
+
+    -- Studio look: nothing is created until "Apply studio look" is pressed
+    obs.obs_data_set_default_string(s, "studio_bg_type", "gradient")
+    obs.obs_data_set_default_int(s, "studio_bg_color1", 0xFFFC5D6D) -- #6D5DFC, stored as 0xAABBGGRR
+    obs.obs_data_set_default_int(s, "studio_bg_color2", 0xFFDBC81F) -- #1FC8DB
+    obs.obs_data_set_default_int(s, "studio_bg_angle", 135)
+    obs.obs_data_set_default_string(s, "studio_bg_image", "")
+    obs.obs_data_set_default_double(s, "studio_padding", 6)
+    obs.obs_data_set_default_int(s, "studio_radius", 18)
+    obs.obs_data_set_default_bool(s, "studio_shadow_enabled", true)
+    obs.obs_data_set_default_int(s, "studio_shadow_blur", 40)
+    obs.obs_data_set_default_int(s, "studio_shadow_offset", 12)
+    obs.obs_data_set_default_int(s, "studio_shadow_opacity", 45)
 
     obs.obs_data_set_default_bool(s, "debug_logs", false)
 end
@@ -4192,6 +4436,19 @@ function M.read(s)
             only_inside = obs.obs_data_get_bool(s, "fx_only_inside"),
             only_zoomed = obs.obs_data_get_bool(s, "fx_only_zoomed"),
         },
+        studio = {
+            bg_type = obs.obs_data_get_string(s, "studio_bg_type"),
+            color1 = obs.obs_data_get_int(s, "studio_bg_color1"),
+            color2 = obs.obs_data_get_int(s, "studio_bg_color2"),
+            angle = obs.obs_data_get_int(s, "studio_bg_angle"),
+            image = obs.obs_data_get_string(s, "studio_bg_image"),
+            padding = geometry.clamp(obs.obs_data_get_double(s, "studio_padding"), 0, 30),
+            radius = math.max(0, obs.obs_data_get_int(s, "studio_radius")),
+            shadow_on = obs.obs_data_get_bool(s, "studio_shadow_enabled"),
+            shadow_blur = math.max(0, obs.obs_data_get_int(s, "studio_shadow_blur")),
+            shadow_offset = obs.obs_data_get_int(s, "studio_shadow_offset"),
+            shadow_opacity = geometry.clamp(obs.obs_data_get_int(s, "studio_shadow_opacity"), 0, 100) / 100,
+        },
         debug = obs.obs_data_get_bool(s, "debug_logs"),
     }
 end
@@ -4219,7 +4476,7 @@ end
 
 ---
 -- Build the properties panel
----@param ctx table {os, on_refresh, on_diagnose, on_help, on_fx_test}
+---@param ctx table {os, cfg, on_refresh, on_diagnose, on_help, on_fx_test, on_studio_apply, on_studio_remove}
 ---@return any props
 function M.properties(ctx)
     local props = obs.obs_properties_create()
@@ -4329,6 +4586,50 @@ function M.properties(ctx)
     obs.obs_property_set_long_description(test, "Play the sound and show a ripple at the current mouse position")
     obs.obs_properties_add_group(props, "grp_fx", "Click effects", obs.OBS_GROUP_NORMAL, fx)
 
+    -- Studio look
+    local studio = obs.obs_properties_create()
+    local st_type = obs.obs_properties_add_list(studio, "studio_bg_type", "Background",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(st_type, "Gradient", "gradient")
+    obs.obs_property_list_add_string(st_type, "Solid colour", "color")
+    obs.obs_property_list_add_string(st_type, "Image", "image")
+    local st_c1 = obs.obs_properties_add_color(studio, "studio_bg_color1", "Color ")
+    local st_c2 = obs.obs_properties_add_color(studio, "studio_bg_color2", "Second color ")
+    local st_angle = obs.obs_properties_add_int_slider(studio, "studio_bg_angle", "Gradient angle", 0, 360, 1)
+    local st_image = obs.obs_properties_add_path(studio, "studio_bg_image", "Background image ", obs.OBS_PATH_FILE,
+        "Images (*.png *.jpg *.jpeg *.webp *.bmp)", nil)
+    local function show_background(kind)
+        obs.obs_property_set_visible(st_c1, kind ~= "image")
+        obs.obs_property_set_visible(st_c2, kind == "gradient")
+        obs.obs_property_set_visible(st_angle, kind == "gradient")
+        obs.obs_property_set_visible(st_image, kind == "image")
+    end
+    show_background((cfg_now.studio and cfg_now.studio.bg_type) or "gradient")
+    obs.obs_property_set_modified_callback(st_type, function(_, _, settings)
+        show_background(obs.obs_data_get_string(settings, "studio_bg_type"))
+        return true
+    end)
+    local st_pad = obs.obs_properties_add_float_slider(studio, "studio_padding", "Padding (%)", 0, 30, 0.5)
+    obs.obs_property_set_long_description(st_pad, "Space around the picture, in percent of the shorter canvas side")
+    local st_rad = obs.obs_properties_add_int(studio, "studio_radius", "Corner radius (px)", 0, 200, 1)
+    obs.obs_property_set_long_description(st_rad, "In output pixels. 0 keeps the corners square")
+    obs.obs_properties_add_bool(studio, "studio_shadow_enabled", "Drop shadow ")
+    obs.obs_properties_add_int(studio, "studio_shadow_blur", "Shadow blur (px)", 0, 200, 1)
+    obs.obs_properties_add_int(studio, "studio_shadow_offset", "Shadow offset down (px)", -100, 100, 1)
+    obs.obs_properties_add_int_slider(studio, "studio_shadow_opacity", "Shadow opacity (%)", 0, 100, 1)
+    local st_apply = obs.obs_properties_add_button(studio, "studio_apply_button", "Apply studio look", function()
+        ctx.on_studio_apply()
+        return true
+    end)
+    obs.obs_property_set_long_description(st_apply, "Creates the \"OBSCineZoom Studio\" scene (your scene is not changed) " ..
+        "and switches to it. Press it again to rebuild. Changes to these settings then show up by themselves.")
+    local st_remove = obs.obs_properties_add_button(studio, "studio_remove_button", "Remove studio look", function()
+        ctx.on_studio_remove()
+        return true
+    end)
+    obs.obs_property_set_long_description(st_remove, "Switches back to your scene and deletes the studio scenes and images")
+    obs.obs_properties_add_group(props, "grp_studio", "Studio look", obs.OBS_GROUP_NORMAL, studio)
+
     -- Display override
     local override = obs.obs_properties_create()
     local o1 = obs.obs_properties_add_int(override, "override_x", "X", -20000, 20000, 1)
@@ -4428,6 +4729,1260 @@ function M.snap(s, x)
     s.x = x
     s.target = x
     s.v = 0
+end
+
+return M
+end
+
+package.preload["cinezoom.studio"] = function(...)
+-- Studio scene builder: an inset, rounded, shadowed look on a background, built from two real scenes.
+--
+--   "OBSCineZoom Studio"        background, shadow and the frame scene (the user switches to this one)
+--   "OBSCineZoom Studio Frame"  canvas-sized, holds the capture (SCALE_INNER) and the rounded-corner mask
+--
+-- The user's own scene is never touched. Padding, radius and shadow only change the frame item in the
+-- Studio scene and the generated images, never the capture item, so the zoom code needs no changes: it
+-- finds the capture in the frame scene like in any nested scene. Everything is a real, saved source, so
+-- "applied" is simply "the Studio scene holds the frame scene": no flag is stored anywhere.
+-- This controller keeps no OBS references between calls: it looks things up by name and releases them.
+local obs = obslua
+local log = require("cinezoom.log")
+local png = require("cinezoom.assets.png")
+local raster = require("cinezoom.assets.raster")
+local checksum = require("cinezoom.assets.checksum")
+local layout = require("cinezoom.studio.layout")
+local sources = require("cinezoom.obs.sources")
+local opt = require("cinezoom.obs.opt")
+
+local M = {}
+
+M.SCENE = "OBSCineZoom Studio"
+M.FRAME = "OBSCineZoom Studio Frame"
+M.BG = "OBSCineZoom Background"
+M.SHADOW = "OBSCineZoom Shadow"
+M.MASK = "OBSCineZoom Rounded Corners"
+
+-- Test hook: when set, assets are written to this directory only
+M.asset_dir = nil
+
+M.DEBOUNCE = 0.3 -- seconds a changed setting waits before the images are rebuilt
+
+local PREFIX = "obscinezoom-studio-"
+local SCENE, FRAME, BG, SHADOW, MASK = M.SCENE, M.FRAME, M.BG, M.SHADOW, M.MASK
+local GRADIENT_SIDE = 512 -- longest side of the generated gradient image
+
+local get_info = obs.obs_sceneitem_get_info2 or obs.obs_sceneitem_get_info
+local set_info = obs.obs_sceneitem_set_info2 or obs.obs_sceneitem_set_info
+
+local Studio = {}
+Studio.__index = Studio
+
+---
+---@return table controller (creates nothing until apply)
+function M.new()
+    return setmetatable({
+        last_cfg = nil,         -- copy of cfg.studio the sources were last synced to
+        dirty_at = nil,         -- clock time of the latest settings change that still has to be applied
+        prev_scene_name = nil,  -- the scene to go back to on remove
+        pending_resize = false, -- the layout used a guessed source size
+        folder = nil, folder_how = nil, -- folder of the generated images and how it was chosen
+        warned = {},
+        last = nil,             -- the last computed layout, for Diagnose
+    }, Studio)
+end
+
+----------------------------------------------------------------------
+-- small helpers
+----------------------------------------------------------------------
+local function round(v)
+    return math.floor(v + 0.5)
+end
+
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if f == nil then
+        return nil
+    end
+    local size = f:seek("end")
+    f:close()
+    return size
+end
+
+local function join(dir, name)
+    if dir:match("[/\\]$") then
+        return dir .. name
+    end
+    return dir .. "/" .. name
+end
+
+-- Only files we generated are ever deleted, never an image the user chose
+local function is_generated(path)
+    local base = type(path) == "string" and path:match("([^/\\]+)$")
+    return base ~= nil and base:match("^obscinezoom%-studio%-%a+%-v1%-%x+%.png$") ~= nil
+end
+
+local function delete_generated(path)
+    if is_generated(path) then
+        pcall(os.remove, path)
+    end
+end
+
+local function warn_once(self, key, fmt, ...)
+    if not self.warned[key] then
+        self.warned[key] = true
+        log.warn(fmt, ...)
+    end
+end
+
+-- Canvas (base) size, nil when OBS does not tell
+local function canvas()
+    local ok, w, h = pcall(function()
+        local ovi = obs.obs_video_info()
+        if obs.obs_get_video_info(ovi) then
+            return ovi.base_width, ovi.base_height
+        end
+    end)
+    if ok and w and w > 0 and h > 0 then
+        return w, h
+    end
+    return nil
+end
+
+local SETTERS = {
+    string = obs.obs_data_set_string, int = obs.obs_data_set_int,
+    bool = obs.obs_data_set_bool, double = obs.obs_data_set_double,
+}
+
+-- obs_data from a list of {type, key, value}. The caller releases it.
+local function make_data(list)
+    local d = obs.obs_data_create()
+    for _, e in ipairs(list) do
+        SETTERS[e[1]](d, e[2], e[3])
+    end
+    return d
+end
+
+-- Set settings on a source and let go of the data
+local function update(src, list)
+    local d = make_data(list)
+    obs.obs_source_update(src, d)
+    obs.obs_data_release(d)
+end
+
+local function setting(src, key)
+    local d = obs.obs_source_get_settings(src)
+    if d == nil then
+        return ""
+    end
+    local v = obs.obs_data_get_string(d, key)
+    obs.obs_data_release(d)
+    return v
+end
+
+-- Opaque colour int (0xAABBGGRR) from a colour property value
+local function opaque(c)
+    return c % 16777216 + 4278190080
+end
+
+-- Place an item at the top-left with a uniform scale, optionally inside bounds
+local function place(item, t)
+    local info = obs.obs_transform_info()
+    get_info(item, info)
+    info.pos.x, info.pos.y = t.x, t.y
+    info.scale.x, info.scale.y = t.scale or 1, t.scale or 1
+    info.rot = 0
+    info.alignment = 5 -- (5 == OBS_ALIGN_TOP | OBS_ALIGN_LEFT)
+    info.bounds_type = t.bounds_type or obs.OBS_BOUNDS_NONE
+    info.bounds_alignment = 0 -- center
+    if t.bw ~= nil then
+        info.bounds.x, info.bounds.y = t.bw, t.bh
+    end
+    set_info(item, info)
+end
+
+local function clear_crop(item)
+    local crop = obs.obs_sceneitem_crop()
+    crop.left, crop.top, crop.right, crop.bottom = 0, 0, 0, 0
+    obs.obs_sceneitem_set_crop(item, crop)
+end
+
+-- Snapshot of the items of a scene (safe to remove items while walking it)
+local function items_of(scene)
+    local out = {}
+    local list = obs.obs_scene_enum_items(scene)
+    if list ~= nil then
+        for _, it in ipairs(list) do
+            out[#out + 1] = it
+        end
+        obs.sceneitem_list_release(list)
+    end
+    return out
+end
+
+-- Bottom-to-top index (0 = bottom) of an item in a scene, compared by id
+local function index_of(scene, item)
+    local want = obs.obs_sceneitem_get_id(item)
+    for i, it in ipairs(items_of(scene)) do
+        if obs.obs_sceneitem_get_id(it) == want then
+            return i - 1
+        end
+    end
+    return nil
+end
+
+local function copy(t)
+    local c = {}
+    for k, v in pairs(t) do c[k] = v end
+    return c
+end
+
+local function same(a, b)
+    if a == nil or b == nil then
+        return false
+    end
+    for k, v in pairs(a) do
+        if b[k] ~= v then return false end
+    end
+    for k in pairs(b) do
+        if a[k] == nil then return false end
+    end
+    return true
+end
+
+----------------------------------------------------------------------
+-- lookup: the scenes and items by name
+----------------------------------------------------------------------
+-- Returns {studio, frame, frame_src, bg_item, shadow_item, frame_item, held}; release_parts lets go of it
+local function lookup()
+    local p = { held = {} }
+    local function get(name)
+        local src = obs.obs_get_source_by_name(name)
+        if src ~= nil then
+            p.held[#p.held + 1] = src
+            if obs.obs_source_is_scene(src) then
+                return src, obs.obs_scene_from_source(src)
+            end
+        end
+        return src, nil
+    end
+    p.studio_src, p.studio = get(SCENE)
+    p.frame_src, p.frame = get(FRAME)
+    if p.studio ~= nil then
+        p.bg_item = obs.obs_scene_find_source(p.studio, BG)
+        p.shadow_item = obs.obs_scene_find_source(p.studio, SHADOW)
+        p.frame_item = obs.obs_scene_find_source(p.studio, FRAME)
+    end
+    return p
+end
+
+local function release_parts(p)
+    for _, s in ipairs(p.held) do
+        obs.obs_source_release(s)
+    end
+    p.held = {}
+end
+
+----------------------------------------------------------------------
+-- generated files
+----------------------------------------------------------------------
+local function probe(dir)
+    local path = join(dir, PREFIX .. "probe.tmp")
+    local f = io.open(path, "wb")
+    if f == nil then
+        return false
+    end
+    local ok = f:write("x")
+    f:close()
+    pcall(os.remove, path)
+    return ok ~= nil
+end
+
+-- Folders to try, best first: the OBS config folder (survives updates and is per user), the
+-- script folder, then the home folder. Each entry is {dir, description}.
+local function candidates()
+    if M.asset_dir ~= nil then
+        return { { M.asset_dir, "test hook" } }
+    end
+    local list = {}
+    local okc, cfgdir = pcall(function()
+        local f = opt("os_get_config_path_ptr")
+        return f and f("obs-studio/plugin_config")
+    end)
+    if okc and type(cfgdir) == "string" and cfgdir ~= "" then
+        list[#list + 1] = { cfgdir, "os_get_config_path_ptr" }
+    end
+    local sp = rawget(_G, "script_path")
+    if type(sp) == "function" then
+        local ok, dir = pcall(sp)
+        if ok and type(dir) == "string" and dir ~= "" then
+            list[#list + 1] = { dir, "script_path" }
+        end
+    end
+    for _, var in ipairs({ "HOME", "APPDATA" }) do
+        local v = os.getenv(var)
+        if v ~= nil and v ~= "" then
+            list[#list + 1] = { v, "$" .. var }
+        end
+    end
+    return list
+end
+
+---
+-- The folder generated images go to (nil if none is writable), found by writing a probe file
+---@return string|nil dir
+---@return string how
+function Studio:asset_folder()
+    if self.folder ~= nil then
+        return self.folder, self.folder_how
+    end
+    for _, c in ipairs(candidates()) do
+        local ok = probe(c[1])
+        if not ok then
+            local mk = opt("os_mkdirs")
+            if mk ~= nil and pcall(mk, c[1]) then
+                ok = probe(c[1])
+            end
+        end
+        if ok then
+            self.folder, self.folder_how = c[1], c[2]
+            return self.folder, self.folder_how
+        end
+    end
+    return nil, "no writable folder"
+end
+
+-- Path of a generated image. The name comes from the parameters, so the same look always maps to the
+-- same file: it is only written when missing, and a missing file comes back at the same path.
+function Studio:asset(kind, params, make)
+    local dir = self:asset_folder()
+    if dir == nil then
+        warn_once(self, "nodir", "Studio look: no folder is writable for the generated images.")
+        return nil
+    end
+    local path = join(dir, string.format("%s%s-v1-%08x.png", PREFIX, kind, checksum.crc32(params) % 4294967296))
+    local size = file_size(path)
+    if size ~= nil and size > 0 then
+        return path
+    end
+    local bytes = make()
+    local f = io.open(path, "wb")
+    local ok = f ~= nil and f:write(bytes)
+    if f ~= nil then f:close() end
+    if not ok then
+        pcall(os.remove, path)
+        self.folder = nil -- look for another folder next time
+        warn_once(self, "write" .. kind, "Studio look: could not write '%s'.", path)
+        return nil
+    end
+    log.debug("Studio image written: %s (%d bytes)", path, #bytes)
+    return path
+end
+
+----------------------------------------------------------------------
+-- parts: background, shadow and mask filter
+----------------------------------------------------------------------
+-- Make sure a source called `name` of one of `ids` is in `scene`: reuse it, replace one of another kind,
+-- or create it (public, so it is saved with the scene collection). The data goes onto an existing source too.
+-- Returns the scene item and whether it was newly added.
+local function ensure_item(scene, name, ids, list)
+    local src = obs.obs_get_source_by_name(name)
+    if src ~= nil then
+        local id, fits = obs.obs_source_get_id(src), false
+        for _, want in ipairs(ids) do
+            fits = fits or id == want
+        end
+        if not fits then
+            -- another kind of source with our name (an older version used colour sources): take it out
+            -- of our scene and remove it for good. Rename it first: OBS keeps a removed source (and
+            -- its name) alive until every reference is gone, and a new source with the same name
+            -- would then not be found by name.
+            local old = obs.obs_scene_find_source(scene, name)
+            if old ~= nil then obs.obs_sceneitem_remove(old) end
+            pcall(obs.obs_source_set_name, src, name .. " (old)")
+            obs.obs_source_remove(src)
+            obs.obs_source_release(src)
+            src = nil
+        end
+    end
+    local created = false
+    if src == nil then
+        for _, id in ipairs(ids) do
+            local d = make_data(list)
+            src = obs.obs_source_create(id, name, d, nil)
+            obs.obs_data_release(d)
+            if src ~= nil then break end
+        end
+        if src == nil then
+            error("could not create the source '" .. name .. "'", 0)
+        end
+        created = true
+    else
+        update(src, list)
+    end
+    local item = obs.obs_scene_find_source(scene, name)
+    if item == nil then
+        item = obs.obs_scene_add(scene, src)
+        created = true
+    end
+    obs.obs_source_release(src)
+    if item == nil then
+        error("could not add '" .. name .. "' to the scene", 0)
+    end
+    return item, created
+end
+
+-- Leftover copies of our background or shadow (e.g. "OBSCineZoom Background 2", or one renamed to
+-- "... (old)") that an earlier version could leave in the Studio scene, possibly covering the picture
+local function remove_strays(scene)
+    for _, it in ipairs(items_of(scene)) do
+        local src = obs.obs_sceneitem_get_source(it)
+        local n = src ~= nil and obs.obs_source_get_name(src) or ""
+        if n ~= BG and n ~= SHADOW and (n:sub(1, #BG) == BG or n:sub(1, #SHADOW) == SHADOW) then
+            log.info("Studio look: removing the leftover source '%s'.", n)
+            obs.obs_sceneitem_remove(it)
+            local s2 = obs.obs_get_source_by_name(n)
+            if s2 ~= nil then
+                obs.obs_source_remove(s2)
+                obs.obs_source_release(s2)
+            end
+        end
+    end
+end
+
+local function image_list(path)
+    return { { "string", "file", path or "" }, { "bool", "unload", false } }
+end
+
+-- The background source settings. It is always an image source (gradient, solid colour or the user's
+-- image), so switching the background type only changes the file and never replaces the source.
+local function bg_spec(c, cw, ch, path)
+    return { "image_source" }, image_list(path)
+end
+
+-- The mask filter on the frame scene: created on first use, updated afterwards. radius 0 turns it off.
+local function ensure_mask(frame_src, path, enabled)
+    local function list(v2)
+        return {
+            { "string", "type", "mask_alpha_filter.effect" }, { "string", "image_path", path or "" },
+            { "bool", "stretch", true }, { "int", "color", 4294967295 },
+            v2 and { "double", "opacity", 1.0 } or { "int", "opacity", 100 },
+        }
+    end
+    local f = obs.obs_source_get_filter_by_name(frame_src, MASK)
+    if f == nil then
+        for _, id in ipairs({ "mask_filter_v2", "mask_filter" }) do
+            local d = make_data(list(id == "mask_filter_v2"))
+            f = obs.obs_source_create_private(id, MASK, d)
+            obs.obs_data_release(d)
+            if f ~= nil then break end
+        end
+        if f == nil then
+            return false
+        end
+        obs.obs_source_filter_add(frame_src, f) -- the scene holds its own reference now
+    else
+        update(f, list(obs.obs_source_get_id(f) == "mask_filter_v2"))
+    end
+    pcall(obs.obs_source_set_enabled, f, enabled) -- missing in very old OBS: the mask then stays on
+    obs.obs_source_release(f)
+    return true
+end
+
+----------------------------------------------------------------------
+-- layout and images
+----------------------------------------------------------------------
+-- Size of the picture in the frame scene: the camera size while we are attached to it (after the user's
+-- crop and unaffected by the zoom), else what the source reports. Third result: false when it was guessed.
+local function source_size(p, si, cw, ch)
+    for _, it in ipairs(items_of(p.frame)) do
+        local src = obs.obs_sceneitem_get_source(it)
+        if src ~= nil and not obs.obs_source_is_scene(src) then -- the click overlay is a scene
+            if si ~= nil and si.ready and si.name == obs.obs_source_get_name(src) and si.cam_w > 0 and si.cam_h > 0 then
+                return si.cam_w, si.cam_h, true
+            end
+            local w, h = obs.obs_source_get_width(src), obs.obs_source_get_height(src)
+            if w > 0 and h > 0 then
+                return w, h, true
+            end
+            break
+        end
+    end
+    return cw, ch, false
+end
+
+-- Shadow image parameters as one string (the file name is a checksum of it)
+local function shadow_key(spec, opacity)
+    return string.format("%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%.4f", spec.w, spec.h, spec.inner.x, spec.inner.y,
+        spec.inner.w, spec.inner.h, spec.r, spec.box, opacity)
+end
+
+local function mask_key(m)
+    return string.format("%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f", m.w, m.h, m.rect.x, m.rect.y, m.rect.w, m.rect.h, m.r)
+end
+
+-- Delete the generated file a source used before, when it now uses another one
+local function retire(old, new)
+    if old ~= nil and old ~= "" and old ~= new then
+        delete_generated(old)
+    end
+end
+
+---
+-- Bring the sources, images and transforms in line with the settings.
+---@param c table cfg.studio
+---@param si table|nil scene item controller (its camera size is the source size)
+---@param opts table|nil {keep_transforms = true} only rebuild images, do not touch positions
+function Studio:sync(c, si, opts)
+    opts = opts or {}
+    local cw, ch = canvas()
+    if cw == nil then
+        error("the canvas size is unknown", 0)
+    end
+    local p = lookup()
+    local ok, err = pcall(self.sync_parts, self, p, c, si, cw, ch, opts)
+    release_parts(p)
+    if not ok then
+        error(err, 0)
+    end
+end
+
+function Studio:sync_parts(p, c, si, cw, ch, opts)
+    if p.studio == nil or p.frame == nil or p.frame_item == nil then
+        error("the studio scenes are incomplete, press Apply studio look again", 0)
+    end
+    local sw, sh, known = source_size(p, si, cw, ch)
+    self.pending_resize = not known
+
+    local content = layout.frame_content(cw, ch, sw, sh)
+    local target = layout.target_rect(cw, ch, sw, sh, c.padding)
+    local tf = layout.frame_transform(content, target)
+    local blur = c.shadow_on and c.shadow_blur or 0
+    local srect = layout.shadow_rect(target, blur, 0, c.shadow_offset)
+    local mspec = layout.mask_spec(cw, ch, content, tf.scale, c.radius)
+    self.last = { cw = cw, ch = ch, sw = sw, sh = sh, known = known, content = content, target = target, tf = tf,
+        shadow = srect }
+
+    -- rounded corners: the mask on the frame scene (nothing to draw with radius 0)
+    local round_on = c.radius > 0
+    local mask_path = nil
+    if round_on then
+        mask_path = self:asset("mask", mask_key(mspec), function()
+            return png.encode(mspec.w, mspec.h, raster.rounded_mask_rgba(mspec.w, mspec.h, mspec.rect, mspec.r))
+        end)
+    end
+    local old_mask = ""
+    local mf = obs.obs_source_get_filter_by_name(p.frame_src, MASK)
+    if mf ~= nil then
+        old_mask = setting(mf, "image_path")
+        obs.obs_source_release(mf)
+    end
+    if not ensure_mask(p.frame_src, mask_path, round_on and mask_path ~= nil) then
+        warn_once(self, "mask", "Studio look: no mask filter is available in this OBS, so the corners stay square.")
+    end
+    retire(old_mask, mask_path)
+
+    -- background
+    local bg_path = nil
+    if c.bg_type == "gradient" then
+        local s = GRADIENT_SIDE / math.max(cw, ch)
+        local gw, gh = math.max(1, round(cw * s)), math.max(1, round(ch * s))
+        bg_path = self:asset("gradient", string.format("%d,%d,%d,%d,%d", gw, gh, c.color1, c.color2, c.angle), function()
+            return png.encode(gw, gh, raster.gradient_rgba(gw, gh, c.color1, c.color2, c.angle))
+        end)
+    elseif c.bg_type == "color" then
+        local col = opaque(c.color1)
+        bg_path = self:asset("solid", string.format("%d", col), function()
+            return png.encode(16, 16, raster.gradient_rgba(16, 16, col, col, 0))
+        end)
+    elseif c.bg_type == "image" then
+        if c.image ~= "" and file_size(c.image) ~= nil then
+            bg_path = c.image
+        else
+            warn_once(self, "bg" .. c.image, "Studio look: cannot read the background image '%s', using the gradient.", c.image)
+            c = copy(c)
+            c.bg_type = "gradient"
+            return self:sync_parts(p, c, si, cw, ch, opts)
+        end
+    end
+    local old_bg = p.bg_item ~= nil and setting(obs.obs_sceneitem_get_source(p.bg_item), "file") or ""
+    local ids, list = bg_spec(c, cw, ch, bg_path)
+    local bg_item, fresh = ensure_item(p.studio, BG, ids, list)
+    if fresh then
+        obs.obs_sceneitem_set_order_position(bg_item, 0)
+        obs.obs_sceneitem_set_locked(bg_item, true)
+    end
+    retire(old_bg, bg_path)
+    if not opts.keep_transforms or fresh then
+        place(bg_item, { x = 0, y = 0, bounds_type = c.bg_type == "image" and obs.OBS_BOUNDS_SCALE_OUTER
+            or obs.OBS_BOUNDS_STRETCH, bw = cw, bh = ch })
+    end
+
+    -- shadow
+    local shadow_on = c.shadow_on and c.shadow_opacity > 0
+    local shadow_path = nil
+    if shadow_on then
+        local spec = layout.shadow_spec(target, c.shadow_blur, c.radius)
+        shadow_path = self:asset("shadow", shadow_key(spec, c.shadow_opacity), function()
+            return png.encode(spec.w, spec.h, raster.shadow_rgba(spec, c.shadow_opacity))
+        end)
+    end
+    local shadow_item = p.shadow_item
+    if shadow_item == nil then
+        shadow_item = ensure_item(p.studio, SHADOW, { "image_source" }, image_list(shadow_path))
+        obs.obs_sceneitem_set_order_position(shadow_item, 1)
+        obs.obs_sceneitem_set_locked(shadow_item, true)
+    else
+        local ssrc = obs.obs_sceneitem_get_source(shadow_item)
+        retire(setting(ssrc, "file"), shadow_path)
+        update(ssrc, image_list(shadow_path))
+    end
+    obs.obs_sceneitem_set_visible(shadow_item, shadow_path ~= nil)
+
+    -- background, shadow, frame at the bottom in that order (items the user added stay above them)
+    for pos, it in ipairs({ bg_item, shadow_item, p.frame_item }) do
+        pcall(obs.obs_sceneitem_set_order_position, it, pos - 1)
+    end
+    remove_strays(p.studio)
+
+    if not opts.keep_transforms then
+        place(shadow_item, { x = srect.x, y = srect.y, bounds_type = obs.OBS_BOUNDS_STRETCH, bw = srect.w, bh = srect.h })
+        place(p.frame_item, { x = tf.pos_x, y = tf.pos_y, scale = tf.scale })
+    end
+end
+
+----------------------------------------------------------------------
+-- state
+----------------------------------------------------------------------
+---
+-- True when the Studio scene exists and holds the frame scene
+---@return boolean
+function Studio:is_applied()
+    local p = lookup()
+    local applied = p.studio ~= nil and p.frame ~= nil and p.frame_item ~= nil
+    release_parts(p)
+    return applied
+end
+
+-- Is name the Studio scene or the frame scene (they must never be the zoom source or the way back)
+local function is_ours(name)
+    return name == SCENE or name == FRAME
+end
+
+-- Name of a scene to go back to: the remembered one if it still exists, else any other scene
+function Studio:fallback_scene()
+    local found = nil
+    if self.prev_scene_name ~= nil and not is_ours(self.prev_scene_name) then
+        local s = obs.obs_get_source_by_name(self.prev_scene_name)
+        if s ~= nil then
+            if obs.obs_source_is_scene(s) then
+                found = self.prev_scene_name
+            end
+            obs.obs_source_release(s)
+        end
+    end
+    if found == nil then
+        local list = obs.obs_frontend_get_scenes()
+        if list ~= nil then
+            for _, s in ipairs(list) do
+                local n = obs.obs_source_get_name(s)
+                if found == nil and not is_ours(n) then
+                    found = n
+                end
+            end
+            obs.source_list_release(list)
+        end
+    end
+    return found
+end
+
+local function current_scene_name()
+    local cur = obs.obs_frontend_get_current_scene()
+    if cur == nil then
+        return nil
+    end
+    local n = obs.obs_source_get_name(cur)
+    obs.obs_source_release(cur)
+    return n
+end
+
+----------------------------------------------------------------------
+-- apply
+----------------------------------------------------------------------
+-- A name taken by something of the wrong kind stops Apply before anything is changed. ids nil: the
+-- name must be a scene, otherwise a source of one of ids. Returns true on a clash.
+local function name_conflict(name, ids)
+    local s = obs.obs_get_source_by_name(name)
+    if s == nil then
+        return false
+    end
+    local ok = false
+    if ids == nil then
+        ok = obs.obs_source_is_scene(s)
+    else
+        local id = obs.obs_source_get_id(s)
+        for _, want in ipairs(ids) do
+            ok = ok or id == want
+        end
+    end
+    obs.obs_source_release(s)
+    return not ok
+end
+
+-- Kinds of source the background and shadow may already be (a leftover of an earlier Apply)
+local BG_KINDS = { "color_source_v3", "color_source", "image_source" }
+
+local function build(self, c, cfg, ctx, capture, cw, ch)
+    -- the capture goes into the frame scene, which is canvas-sized
+    local frame_src, frame, done_frame
+    local existing = obs.obs_get_source_by_name(FRAME)
+    if existing ~= nil then
+        frame_src, frame, done_frame = existing, obs.obs_scene_from_source(existing), function() obs.obs_source_release(existing) end
+    else
+        frame = obs.obs_scene_create(FRAME)
+        if frame == nil then
+            error("could not create the scene '" .. FRAME .. "'", 0)
+        end
+        frame_src, done_frame = obs.obs_scene_get_source(frame), function() obs.obs_scene_release(frame) end
+    end
+    local studio_src, studio, done_studio
+    local ok, err = pcall(function()
+        for _, it in ipairs(items_of(frame)) do
+            local src = obs.obs_sceneitem_get_source(it)
+            -- a capture left from a previous Apply with another zoom source
+            if src ~= nil and obs.obs_source_get_name(src) ~= cfg.source and ctx.is_capture ~= nil and ctx.is_capture(src) then
+                obs.obs_sceneitem_remove(it)
+            end
+        end
+        local item = obs.obs_scene_find_source(frame, cfg.source) or obs.obs_scene_add(frame, capture)
+        if item == nil then
+            error("could not add the zoom source to the scene '" .. FRAME .. "'", 0)
+        end
+        place(item, { x = 0, y = 0, bounds_type = obs.OBS_BOUNDS_SCALE_INNER, bw = cw, bh = ch })
+        clear_crop(item)
+        obs.obs_sceneitem_set_locked(item, true)
+
+        -- the Studio scene: background, shadow and the frame, in that order, with the user's items above
+        local existing_studio = obs.obs_get_source_by_name(SCENE)
+        if existing_studio ~= nil then
+            studio_src, studio = existing_studio, obs.obs_scene_from_source(existing_studio)
+            done_studio = function() obs.obs_source_release(existing_studio) end
+        else
+            studio = obs.obs_scene_create(SCENE)
+            if studio == nil then
+                error("could not create the scene '" .. SCENE .. "'", 0)
+            end
+            studio_src, done_studio = obs.obs_scene_get_source(studio), function() obs.obs_scene_release(studio) end
+        end
+        local ids, list = bg_spec(c, cw, ch, nil)
+        local bg_item = ensure_item(studio, BG, ids, list)
+        local shadow_item = ensure_item(studio, SHADOW, { "image_source" }, image_list(nil))
+        local frame_item = obs.obs_scene_find_source(studio, FRAME) or obs.obs_scene_add(studio, frame_src)
+        if frame_item == nil then
+            error("could not add the frame scene to '" .. SCENE .. "'", 0)
+        end
+        for pos, it in ipairs({ bg_item, shadow_item, frame_item }) do
+            obs.obs_sceneitem_set_order_position(it, pos - 1)
+            obs.obs_sceneitem_set_locked(it, true)
+        end
+
+        self:sync(c, ctx.si)
+        local okc, errc = pcall(obs.obs_frontend_set_current_scene, studio_src)
+        if not okc then
+            log.warn("Studio look: could not switch to the scene '%s' (%s). Select it yourself.", SCENE, tostring(errc))
+        end
+    end)
+    if done_studio ~= nil then done_studio() end
+    done_frame()
+    if not ok then
+        error(err, 0)
+    end
+end
+
+---
+-- Create (or rebuild) the Studio scenes and switch to them.
+---@param cfg table settings table (cfg.source, cfg.studio)
+---@param ctx table {si, fx, attach, is_capture}
+---@return boolean ok
+function Studio:apply(cfg, ctx)
+    local c = cfg.studio
+    if cfg.source == "" or cfg.source == sources.NONE or is_ours(cfg.source) then
+        log.warn("Studio look: select a display capture as the Zoom Source first.")
+        return false
+    end
+    local cw, ch = canvas()
+    if cw == nil then
+        log.warn("Studio look: OBS does not report the canvas size.")
+        return false
+    end
+    local capture = obs.obs_get_source_by_name(cfg.source)
+    if capture == nil then
+        log.warn("Studio look: the Zoom Source '%s' does not exist.", cfg.source)
+        return false
+    end
+    local ok, err = pcall(function()
+        if obs.obs_source_is_scene(capture) then
+            error("the Zoom Source must be a capture, not a scene", 0)
+        end
+        for _, spec in ipairs({ { SCENE }, { FRAME }, { BG, BG_KINDS }, { SHADOW, { "image_source" } } }) do
+            if name_conflict(spec[1], spec[2]) then
+                error(string.format("'%s' already exists and is not a %s. Rename or remove it first.",
+                    spec[1], spec[2] and "background or image source" or "scene"), 0)
+            end
+        end
+
+        -- nothing of ours may stay on the capture while its scene changes
+        ctx.fx:detach_host()
+        ctx.si:release()
+        local now = current_scene_name()
+        if now ~= nil and not is_ours(now) then
+            self.prev_scene_name = now
+        end
+
+        build(self, c, cfg, ctx, capture, cw, ch)
+        self.last_cfg = copy(c)
+        self.dirty_at = nil
+    end)
+    obs.obs_source_release(capture)
+    if not ok then
+        log.error("Studio look could not be applied: %s", tostring(err))
+        pcall(ctx.attach) -- the zoom goes on in whatever scene is current
+        return false
+    end
+    ctx.attach() -- the scene event does not fire when Studio was already current
+    log.info("Studio look applied. Scene '%s' is now current.", SCENE)
+    return true
+end
+
+----------------------------------------------------------------------
+-- live updates
+----------------------------------------------------------------------
+---
+-- Call from script_update with the new cfg.studio. The first call only records the baseline.
+function Studio:on_settings(c, now)
+    local old = self.last_cfg
+    if old == nil then
+        self.last_cfg = copy(c)
+        return
+    end
+    if same(old, c) then
+        return
+    end
+    self.last_cfg = copy(c)
+    if self:is_applied() then
+        self.dirty_at = now
+        log.debug("Studio settings changed, updating the look shortly")
+    else
+        log.debug("Studio settings changed; the look is not applied, nothing to update")
+    end
+end
+
+-- Sync from the tick: an error is logged once and never retried by itself
+function Studio:sync_safe(si, why)
+    if self.last_cfg == nil then
+        return
+    end
+    local ok, err = pcall(self.sync, self, self.last_cfg, si)
+    if not ok then
+        self.pending_resize = false
+        log.warn("Studio look: %s failed: %s", why, tostring(err))
+    else
+        log.info("Studio look updated (%s).", why)
+    end
+end
+
+---
+-- Call every tick: applies a settings change once it has been quiet for DEBOUNCE seconds, and finishes a
+-- layout that was computed before the capture had a size.
+function Studio:tick(now, si)
+    if self.dirty_at ~= nil and now - self.dirty_at >= M.DEBOUNCE then
+        self.dirty_at = nil
+        self:sync_safe(si, "update")
+    elseif self.pending_resize and si ~= nil and si.ready then
+        self.pending_resize = false
+        self:sync_safe(si, "layout update")
+    end
+end
+
+---
+-- The capture changed size: recompute the content rect, the mask and the frame transform
+function Studio:on_source_resized(si)
+    if self.last_cfg ~= nil and self:is_applied() then
+        self:sync_safe(si, "resize")
+    end
+end
+
+---
+-- At load and after a collection change: regenerate generated images that went missing (deleted, or the
+-- config moved to another machine). Positions are left alone: the user may have changed them by hand.
+function Studio:repair(cfg, si)
+    local c = cfg.studio
+    if self.last_cfg == nil then
+        self.last_cfg = copy(c)
+    end
+    local p = lookup()
+    local missing = false
+    if p.studio ~= nil and p.frame ~= nil and p.frame_item ~= nil then
+        local paths = {}
+        if p.bg_item ~= nil then paths[#paths + 1] = setting(obs.obs_sceneitem_get_source(p.bg_item), "file") end
+        if p.shadow_item ~= nil then paths[#paths + 1] = setting(obs.obs_sceneitem_get_source(p.shadow_item), "file") end
+        local mf = obs.obs_source_get_filter_by_name(p.frame_src, MASK)
+        if mf ~= nil then
+            paths[#paths + 1] = setting(mf, "image_path")
+            obs.obs_source_release(mf)
+        end
+        for _, path in ipairs(paths) do
+            if is_generated(path) and file_size(path) == nil then
+                missing = true
+            end
+        end
+    end
+    release_parts(p)
+    if missing then
+        log.info("Studio look: regenerating missing images.")
+        self:sync(c, si, { keep_transforms = true })
+    end
+end
+
+---
+-- A scene collection is about to change: the remembered scene belongs to the old one
+function Studio:on_collection_changing()
+    self.prev_scene_name = nil
+    self.dirty_at = nil
+end
+
+----------------------------------------------------------------------
+-- remove
+----------------------------------------------------------------------
+-- Remove the source `name` for good, and its item in `scene` first (OBS drops the rest)
+local function remove_source(scene, name)
+    local item = scene ~= nil and obs.obs_scene_find_source(scene, name) or nil
+    if item ~= nil then
+        obs.obs_sceneitem_remove(item)
+    end
+    local src = obs.obs_get_source_by_name(name)
+    if src ~= nil then
+        obs.obs_source_remove(src)
+        obs.obs_source_release(src)
+    end
+end
+
+---
+-- Take the studio away: everything the script created goes, items the user added to the Studio scene stay.
+---@param ctx table {si, fx, attach}
+---@return boolean ok
+function Studio:remove(ctx)
+    local found = lookup()
+    local nothing = found.studio_src == nil and found.frame_src == nil
+    release_parts(found)
+    if nothing then
+        log.info("Studio look: there is nothing to remove.")
+        return true
+    end
+    ctx.fx:detach_host()
+    ctx.si:release()
+    self.dirty_at, self.pending_resize = nil, false
+    local ok, err = pcall(function()
+        local cur = current_scene_name()
+        if cur ~= nil and is_ours(cur) then
+            local back = self:fallback_scene()
+            local s = back ~= nil and obs.obs_get_source_by_name(back) or nil
+            if s == nil then
+                error("there is no other scene to switch to. Create one first, then remove the studio look.", 0)
+            end
+            local okc, errc = pcall(obs.obs_frontend_set_current_scene, s)
+            obs.obs_source_release(s)
+            if not okc then
+                error("could not switch back to '" .. tostring(back) .. "': " .. tostring(errc), 0)
+            end
+        end
+
+        local p = lookup()
+        local paths = {}
+        local ok2, err2 = pcall(function()
+            -- remember the files before the sources that use them are gone
+            if p.bg_item ~= nil then paths[#paths + 1] = setting(obs.obs_sceneitem_get_source(p.bg_item), "file") end
+            if p.shadow_item ~= nil then paths[#paths + 1] = setting(obs.obs_sceneitem_get_source(p.shadow_item), "file") end
+            if p.frame_src ~= nil then
+                local mf = obs.obs_source_get_filter_by_name(p.frame_src, MASK)
+                if mf ~= nil then
+                    paths[#paths + 1] = setting(mf, "image_path")
+                    obs.obs_source_filter_remove(p.frame_src, mf)
+                    obs.obs_source_release(mf)
+                end
+            end
+            remove_source(p.studio, BG)
+            remove_source(p.studio, SHADOW)
+            if p.frame_item ~= nil then
+                obs.obs_sceneitem_remove(p.frame_item)
+            end
+            if p.frame ~= nil then
+                for _, it in ipairs(items_of(p.frame)) do
+                    obs.obs_sceneitem_remove(it)
+                end
+            end
+        end)
+        if not ok2 then
+            release_parts(p) -- the scenes stay: something could not be taken out of them
+            error(err2, 0)
+        end
+        -- the scenes: the frame scene is ours alone, the Studio scene stays if the user put items in it
+        local studio_left = p.studio ~= nil and #items_of(p.studio) or 0
+        local studio_src, frame_src = p.studio_src, p.frame_src
+        if frame_src ~= nil then
+            obs.obs_source_remove(frame_src)
+        end
+        if studio_src ~= nil then
+            if studio_left == 0 then
+                obs.obs_source_remove(studio_src)
+            else
+                log.info("Studio look removed. The scene '%s' stays because it holds %d item(s) you added.",
+                    SCENE, studio_left)
+            end
+        end
+        release_parts(p)
+        for _, path in ipairs(paths) do
+            delete_generated(path)
+        end
+    end)
+    self.last = nil
+    if not ok then
+        log.error("Studio look could not be removed completely: %s", tostring(err))
+    else
+        log.info("Studio look removed.")
+    end
+    pcall(ctx.attach)
+    return ok
+end
+
+----------------------------------------------------------------------
+-- Diagnose
+----------------------------------------------------------------------
+local function guard(lines, label, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        lines[#lines + 1] = label .. ": unavailable (" .. tostring(err) .. ")"
+    end
+end
+
+local function item_line(scene, name, item)
+    local info = obs.obs_transform_info()
+    get_info(item, info)
+    local src = obs.obs_sceneitem_get_source(item)
+    return string.format("item '%s': id %s, order index %s, locked %s, visible %s, pos=(%.1f,%.1f) scale=(%.3f,%.3f) " ..
+        "bounds_type=%s bounds=(%.1f,%.1f)", name, tostring(obs.obs_source_get_id(src)), tostring(index_of(scene, item)),
+        tostring(obs.obs_sceneitem_locked(item)), tostring(obs.obs_sceneitem_visible(item)), info.pos.x, info.pos.y,
+        info.scale.x, info.scale.y, tostring(info.bounds_type), info.bounds.x, info.bounds.y)
+end
+
+local function rect_text(r)
+    return string.format("x=%.1f y=%.1f w=%.1f h=%.1f", r.x, r.y, r.w, r.h)
+end
+
+---
+---@param si table|nil scene item controller
+---@return table lines for Diagnose
+function Studio:describe(si)
+    local lines = {}
+    local p = lookup()
+    local ok, err = pcall(function()
+        local applied = p.studio ~= nil and p.frame ~= nil and p.frame_item ~= nil
+        lines[#lines + 1] = string.format("applied: %s (scene '%s': %s, frame scene '%s': %s)", tostring(applied),
+            SCENE, p.studio_src and "found" or "missing", FRAME, p.frame_src and "found" or "missing")
+        local cw, ch = canvas()
+        lines[#lines + 1] = "canvas: " .. (cw and (cw .. "x" .. ch) or "unknown")
+        lines[#lines + 1] = "os_get_config_path_ptr available: " .. tostring(opt("os_get_config_path_ptr") ~= nil)
+        if not applied then
+            lines[#lines + 1] = "studio look is off (nothing created, no folder probed)"
+            return
+        end
+        -- only now: this writes a small probe file
+        local dir, how = self:asset_folder()
+        lines[#lines + 1] = string.format("asset directory: %s (chosen via %s)", tostring(dir), tostring(how))
+
+        local l = self.last
+        if l ~= nil then
+            lines[#lines + 1] = string.format("source size used: %dx%d (%s)", l.sw, l.sh,
+                l.known and "measured" or "guessed, waiting for the first frame")
+            lines[#lines + 1] = "content rect in the frame scene: " .. rect_text(l.content)
+            lines[#lines + 1] = "target rect on the canvas: " .. rect_text(l.target)
+            lines[#lines + 1] = string.format("frame transform: scale %.4f, pos (%.1f,%.1f)", l.tf.scale, l.tf.pos_x, l.tf.pos_y)
+            lines[#lines + 1] = "shadow rect: " .. rect_text(l.shadow)
+        else
+            lines[#lines + 1] = "layout: not computed in this session yet"
+        end
+
+        local paths = {}
+        for _, e in ipairs({ { p.bg_item, BG }, { p.shadow_item, SHADOW }, { p.frame_item, FRAME } }) do
+            guard(lines, e[2], function()
+                if e[1] == nil then
+                    lines[#lines + 1] = "item '" .. e[2] .. "': missing"
+                    return
+                end
+                lines[#lines + 1] = item_line(p.studio, e[2], e[1])
+                local src = obs.obs_sceneitem_get_source(e[1])
+                if e[2] ~= FRAME then
+                    paths[#paths + 1] = setting(src, "file")
+                end
+                if e[2] == BG then
+                    local id = obs.obs_source_get_id(src)
+                    lines[#lines + 1] = "background source id: " .. tostring(id)
+                end
+            end)
+        end
+        guard(lines, "mask filter", function()
+            local mf = obs.obs_source_get_filter_by_name(p.frame_src, MASK)
+            if mf == nil then
+                lines[#lines + 1] = "mask filter: missing"
+                return
+            end
+            local d = obs.obs_source_get_settings(mf)
+            lines[#lines + 1] = string.format("mask filter: id %s, enabled %s, settings %s", tostring(obs.obs_source_get_id(mf)),
+                tostring(obs.obs_source_enabled(mf)), tostring(obs.obs_data_get_json(d)))
+            paths[#paths + 1] = setting(mf, "image_path")
+            obs.obs_data_release(d)
+            obs.obs_source_release(mf)
+        end)
+        guard(lines, "capture", function()
+            for _, it in ipairs(items_of(p.frame)) do
+                local src = obs.obs_sceneitem_get_source(it)
+                if obs.obs_source_is_scene(src) then
+                    lines[#lines + 1] = item_line(p.frame, "overlay in frame scene", it)
+                else
+                    lines[#lines + 1] = item_line(p.frame, "capture in frame scene", it)
+                    local names = {}
+                    local filters = obs.obs_source_enum_filters(src)
+                    if filters ~= nil then
+                        for _, f in ipairs(filters) do
+                            names[#names + 1] = obs.obs_source_get_name(f)
+                        end
+                        obs.source_list_release(filters)
+                    end
+                    lines[#lines + 1] = "capture filters, in order: " .. (#names > 0 and table.concat(names, ", ") or "none")
+                end
+            end
+        end)
+        for _, path in ipairs(paths) do
+            if path ~= "" then
+                local size = file_size(path)
+                local writable = false
+                local f = io.open(path, "ab")
+                if f ~= nil then
+                    writable = true
+                    f:close()
+                end
+                lines[#lines + 1] = string.format("image: %s, exists %s, %s bytes, writable %s, generated %s", path,
+                    tostring(size ~= nil), tostring(size), tostring(writable), tostring(is_generated(path)))
+            end
+        end
+        local cur = current_scene_name()
+        lines[#lines + 1] = "current scene is the Studio scene: " .. tostring(cur == SCENE)
+        local in_frame = false
+        if si ~= nil and si.item ~= nil then
+            local sc = obs.obs_sceneitem_get_scene(si.item)
+            in_frame = sc ~= nil and obs.obs_source_get_name(obs.obs_scene_get_source(sc)) == FRAME
+        end
+        lines[#lines + 1] = "zoom item is in the frame scene: " .. tostring(in_frame)
+        lines[#lines + 1] = "pending resize: " .. tostring(self.pending_resize)
+    end)
+    release_parts(p)
+    if not ok then
+        lines[#lines + 1] = "could not describe the studio: " .. tostring(err)
+    end
+    return lines
+end
+
+return M
+end
+
+package.preload["cinezoom.studio.layout"] = function(...)
+-- Studio layout math: pure functions, no OBS calls. All values are canvas pixels (fractional).
+-- Two coordinate spaces are involved:
+--   * the frame scene: canvas-sized, holds the capture fitted (SCALE_INNER) and centred
+--   * the canvas: where the frame scene ends up once the frame item in the Studio scene is
+--     scaled and moved (frame_transform), leaving room for the background around it
+local M = {}
+
+local function round(v)
+    return math.floor(v + 0.5)
+end
+
+---
+-- Size of a picture sw x sh scaled to fit inside bw x bh (aspect kept)
+---@return number w, number h
+function M.fit(sw, sh, bw, bh)
+    local s = math.min(bw / sw, bh / sh)
+    return sw * s, sh * s
+end
+
+---
+-- Where the capture lands inside the canvas-sized frame scene: fitted, then centred
+---@return table rect {x, y, w, h}
+function M.frame_content(cw, ch, sw, sh)
+    local w, h = M.fit(sw, sh, cw, ch)
+    return { x = (cw - w) / 2, y = (ch - h) / 2, w = w, h = h }
+end
+
+---
+-- Where the picture ends up on the canvas: the canvas minus the padding on every side, fitted and centred.
+---@param pad_pct number Padding in percent of the shorter canvas side
+---@return table rect {x, y, w, h}
+function M.target_rect(cw, ch, sw, sh, pad_pct)
+    local pad = pad_pct / 100 * math.min(cw, ch)
+    local aw, ah = math.max(1, cw - 2 * pad), math.max(1, ch - 2 * pad)
+    local w, h = M.fit(sw, sh, aw, ah)
+    return { x = (cw - w) / 2, y = (ch - h) / 2, w = w, h = h }
+end
+
+---
+-- Transform of the frame item (alignment top-left, bounds NONE) that maps the content rect
+-- of the frame scene onto the target rect.
+---@return table {scale, pos_x, pos_y}
+function M.frame_transform(content, target)
+    local scale = target.w / content.w
+    return { scale = scale, pos_x = target.x - content.x * scale, pos_y = target.y - content.y * scale }
+end
+
+---
+-- Where a frame-scene point is on the canvas
+---@return number x, number y
+function M.canvas_point(pt, tf)
+    return tf.pos_x + pt.x * tf.scale, tf.pos_y + pt.y * tf.scale
+end
+
+---
+-- The shadow image rect: the target grown by blur on every side, then moved by the offset
+---@return table rect {x, y, w, h}
+function M.shadow_rect(target, blur, off_x, off_y)
+    return {
+        x = target.x - blur + off_x, y = target.y - blur + off_y,
+        w = target.w + 2 * blur, h = target.h + 2 * blur,
+    }
+end
+
+---
+-- Mask image: canvas aspect, at most 960 px on the long side. The corner radius is given in
+-- output pixels, so it is divided by the frame scale to get frame-scene pixels.
+---@return table {w, h, rect, r}
+function M.mask_spec(cw, ch, content, scale, radius_px)
+    local ms = math.min(1, 960 / math.max(cw, ch))
+    local rect = { x = content.x * ms, y = content.y * ms, w = content.w * ms, h = content.h * ms }
+    local r = math.max(0, math.min(radius_px / scale * ms, rect.w / 2, rect.h / 2))
+    return { w = round(cw * ms), h = round(ch * ms), rect = rect, r = r }
+end
+
+---
+-- Shadow image: a quarter of the output size is plenty for a blurred shape
+---@param q number|nil Image pixels per canvas pixel
+---@return table {w, h, inner, r, box}
+function M.shadow_spec(target, blur, radius_px, q)
+    q = q or 0.25
+    return {
+        w = math.ceil((target.w + 2 * blur) * q),
+        h = math.ceil((target.h + 2 * blur) * q),
+        inner = { x = blur * q, y = blur * q, w = target.w * q, h = target.h * q },
+        r = radius_px * q,
+        box = math.max(1, round(blur * q / 3)),
+    }
 end
 
 return M

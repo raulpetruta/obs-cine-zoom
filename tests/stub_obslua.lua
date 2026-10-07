@@ -27,7 +27,8 @@ function M.new()
         channels = {},         -- output channels: index -> source (the channel holds a reference)
         media_restarts = 0,    -- obs_source_media_restart calls
         next_item_id = 1,
-        unavailable_ids = {},  -- source ids obs_source_create_private fails for (returns nil)
+        unavailable_ids = {},  -- source ids obs_source_create_private / obs_source_create fail for (return nil)
+        canvas = { w = 1920, h = 1080 }, -- base canvas size obs_get_video_info reports
     }
 
     -- constants
@@ -108,6 +109,22 @@ function M.new()
         if world.scene_source then world.scene_source.refs = world.scene_source.refs + 1 end
         return world.scene_source
     end
+    -- Switching scenes fires SCENE_CHANGED like OBS does, but only when the scene really changes
+    function obs.obs_frontend_set_current_scene(src)
+        assert(src, "set_current_scene of nil")
+        world.scene_switches = (world.scene_switches or 0) + 1
+        if world.scene_source ~= src then
+            world.scene_source = src
+            world.fire_event(obs.OBS_FRONTEND_EVENT_SCENE_CHANGED)
+        end
+    end
+    function obs.obs_frontend_get_scenes()
+        local list = {}
+        for _, s in ipairs(world.sources) do
+            if s.id == "scene" and not s.removed then s.refs = s.refs + 1; list[#list + 1] = s end
+        end
+        return list
+    end
     function obs.obs_frontend_add_event_callback(cb) world.frontend_callbacks[cb] = true end
     function obs.obs_frontend_remove_event_callback(cb) world.frontend_callbacks[cb] = nil end
     function world.fire_event(e) for cb in pairs(world.frontend_callbacks) do cb(e) end end
@@ -140,13 +157,21 @@ function M.new()
     function obs.obs_source_get_id(s) return s.id end
     function obs.obs_get_source_by_name(name)
         for _, s in ipairs(world.sources) do
-            if s.name == name then s.refs = s.refs + 1; return s end
+            if s.name == name and not s.removed then s.refs = s.refs + 1; return s end
         end
         return nil
     end
+    local function live_sources()
+        local list = {}
+        for _, s in ipairs(world.sources) do
+            if not s.removed then list[#list + 1] = s end
+        end
+        return list
+    end
     function obs.obs_enum_sources()
-        for _, s in ipairs(world.sources) do s.refs = s.refs + 1 end
-        return world.sources
+        local list = live_sources()
+        for _, s in ipairs(list) do s.refs = s.refs + 1 end
+        return list
     end
     function obs.obs_source_get_base_width(s) return s.base_w end
     function obs.obs_source_get_base_height(s) return s.base_h end
@@ -157,7 +182,8 @@ function M.new()
     function obs.obs_source_is_group(s) return s.id == "group" end
 
     -- private sources and filters (never listed, never saved)
-    local FILTER_IDS = { crop_filter = true, color_filter = true, color_filter_v2 = true }
+    local FILTER_IDS = { crop_filter = true, color_filter = true, color_filter_v2 = true, mask_filter = true,
+        mask_filter_v2 = true }
     local function png_size(path)
         local f = io.open(path, "rb")
         if not f then return 0, 0 end
@@ -166,6 +192,12 @@ function M.new()
         if not head or #head < 24 or head:sub(2, 4) ~= "PNG" then return 0, 0 end
         local function be(i) local a, b, c, d = head:byte(i, i + 3); return ((a * 256 + b) * 256 + c) * 256 + d end
         return be(17), be(21)
+    end
+    -- size an image or colour source reports for its settings
+    local function source_size(id, vals)
+        if id == "image_source" then return png_size(vals.file or "") end
+        if id == "color_source" or id == "color_source_v3" then return vals.width or 0, vals.height or 0 end
+        return 0, 0
     end
     function obs.obs_source_create_private(id, name, settings)
         if world.unavailable_ids[id] then return nil end
@@ -212,7 +244,42 @@ function M.new()
     function obs.obs_source_update(f, settings)
         world.update_calls = world.update_calls + 1
         f.applied = deep_copy(settings.vals)
-        if f.kind ~= "filter" then copy_into(f.settings.vals, settings.vals) end
+        if f.settings ~= settings then copy_into(f.settings.vals, settings.vals) end
+        if f.id == "image_source" or f.id == "color_source" or f.id == "color_source_v3" then
+            f.base_w, f.base_h = source_size(f.id, f.settings.vals)
+        end
+    end
+    function obs.obs_source_set_enabled(s, v) s.enabled = v end
+    function obs.obs_source_enabled(s) return s.enabled ~= false end
+
+    -- public sources: saved with the scene collection, listed by obs_enum_sources. The caller owns the
+    -- returned reference; a scene item adds its own. A removed source ends at 0 references.
+    function obs.obs_source_create(id, name, settings)
+        if world.unavailable_ids[id] then return nil end
+        local src = { id = id, name = name, refs = 1, base_refs = 0, kind = "source", filters = {}, handler = {},
+            settings = { vals = {}, defs = {} } }
+        if settings then copy_into(src.settings.vals, settings.vals) end
+        src.base_w, src.base_h = source_size(id, src.settings.vals)
+        world.sources[#world.sources + 1] = src
+        return src
+    end
+    -- Removing a source takes it out of every scene (each item drops its reference), and a scene made by
+    -- obs_scene_create also drops the reference the frontend holds for it
+    function obs.obs_source_remove(s)
+        assert(s, "remove of nil source")
+        for _, other in ipairs(world.sources) do
+            if other.scene and not other.removed then
+                local items = {}
+                for _, it in ipairs(other.scene.items) do items[#items + 1] = it end
+                for _, it in ipairs(items) do
+                    if it.source == s then obs.obs_sceneitem_remove(it) end
+                end
+            end
+        end
+        if not s.removed then
+            s.removed = true
+            if s.frontend_ref then s.refs = s.refs - 1 end
+        end
     end
 
     -- audio and media (private sources only in practice)
@@ -306,6 +373,15 @@ function M.new()
         world.private[#world.private + 1] = src
         return src.scene
     end
+    -- a public scene (saved, listed in the Scenes dock): one reference for the frontend, one returned
+    function obs.obs_scene_create(name)
+        if world.unavailable_ids.scene then return nil end
+        local src = { id = "scene", name = name, refs = 2, frontend_ref = true, kind = "source", handler = {},
+            filters = {}, settings = { vals = {}, defs = {} } }
+        src.scene = { source = src, items = {} }
+        world.sources[#world.sources + 1] = src
+        return src.scene
+    end
     function obs.obs_scene_release(scene) assert(scene, "release of nil scene"); scene.source.refs = scene.source.refs - 1 end
     function obs.obs_scene_add(scene, source)
         assert(source, "obs_scene_add of nil source")
@@ -337,6 +413,8 @@ function M.new()
     function obs.obs_scene_is_group(scene) return scene.is_group == true end
     function obs.obs_sceneitem_set_locked(it, v) it.locked = v end
     function obs.obs_sceneitem_set_visible(it, v) it.visible = v end
+    function obs.obs_sceneitem_locked(it) return it.locked end
+    function obs.obs_sceneitem_visible(it) return it.visible end
     function obs.obs_sceneitem_get_id(it) return it.id end
     function obs.obs_scene_find_sceneitem_by_id(scene, id)
         for _, it in ipairs(scene.items) do
@@ -363,7 +441,7 @@ function M.new()
     function obs.obs_sceneitem_set_crop(it, crop) copy_into(it.crop, crop) end
 
     function obs.obs_video_info() return { base_width = 0, base_height = 0 } end
-    function obs.obs_get_video_info(v) v.base_width, v.base_height = 1920, 1080; return true end
+    function obs.obs_get_video_info(v) v.base_width, v.base_height = world.canvas.w, world.canvas.h; return true end
 
     ------------------------------------------------------------------ properties UI
     function obs.obs_properties_create() return { items = {} } end
@@ -410,18 +488,39 @@ function M.new()
     function obs.obs_property_list_item_int(p, i) return p.items[i + 1].value end
 
     ------------------------------------------------------------------ leak report
-    -- Anything still referenced after unload (the scene source is owned by the test)
-    function world.leaks()
+    -- Anything still referenced after unload (the scene source is owned by the test). A live public source
+    -- holds its own reference (the test or the frontend owns it; a source made by obs_source_create has
+    -- none) plus one per scene item that references it, a removed source none.
+    -- opts.allow_filters = { [name] = true } lists filters that may stay attached to public sources
+    -- (the studio's mask filter stays with its scene by design).
+    function world.leaks(opts)
+        opts = opts or {}
+        local allow = opts.allow_filters or {}
         local out = {}
+        local held = {} -- source -> number of items in live public scenes that hold a reference to it
+        for _, s in ipairs(world.sources) do
+            if s.scene and not s.removed then
+                for _, it in ipairs(s.scene.items) do
+                    if it.owns_source then held[it.source] = (held[it.source] or 0) + 1 end
+                end
+            end
+        end
         local function check_scene(name, scene)
             for _, it in ipairs(scene.items) do
                 if it.refs ~= 1 then out[#out + 1] = string.format("item %s in %s refs=%d", it.source.name, name, it.refs) end
             end
         end
         for _, s in ipairs(world.sources) do
-            if s.refs ~= 1 then out[#out + 1] = string.format("source %s refs=%d", s.name, s.refs) end
-            for _, f in ipairs(s.filters or {}) do out[#out + 1] = "filter still attached: " .. f.name end
-            if s.scene then check_scene(s.name, s.scene) end
+            if s.removed then
+                if s.refs ~= 0 then out[#out + 1] = string.format("removed source %s refs=%d", s.name, s.refs) end
+            else
+                local want = (s.base_refs or 1) + (held[s] or 0)
+                if s.refs ~= want then out[#out + 1] = string.format("source %s refs=%d, expected %d", s.name, s.refs, want) end
+                for _, f in ipairs(s.filters or {}) do
+                    if not allow[f.name] then out[#out + 1] = "filter still attached: " .. f.name end
+                end
+                if s.scene then check_scene(s.name, s.scene) end
+            end
         end
         for _, s in ipairs(world.private) do
             if s.refs ~= 0 then out[#out + 1] = string.format("private %s refs=%d", s.name, s.refs) end
