@@ -1,6 +1,7 @@
 -- Settings: defaults, reading them into a plain table, and the properties (UI) panel.
 local obs = obslua
 local camera = require("cinezoom.camera")
+local geometry = require("cinezoom.geometry")
 local sources = require("cinezoom.obs.sources")
 local remote = require("cinezoom.remote")
 
@@ -50,6 +51,19 @@ function M.defaults(s)
     obs.obs_data_set_default_string(s, "fx_ripple_file", "")
     obs.obs_data_set_default_bool(s, "fx_only_inside", true)
     obs.obs_data_set_default_bool(s, "fx_only_zoomed", false)
+
+    -- Studio look: nothing is created until "Apply studio look" is pressed
+    obs.obs_data_set_default_string(s, "studio_bg_type", "gradient")
+    obs.obs_data_set_default_int(s, "studio_bg_color1", 0xFFFC5D6D) -- #6D5DFC, stored as 0xAABBGGRR
+    obs.obs_data_set_default_int(s, "studio_bg_color2", 0xFFDBC81F) -- #1FC8DB
+    obs.obs_data_set_default_int(s, "studio_bg_angle", 135)
+    obs.obs_data_set_default_string(s, "studio_bg_image", "")
+    obs.obs_data_set_default_double(s, "studio_padding", 6)
+    obs.obs_data_set_default_int(s, "studio_radius", 18)
+    obs.obs_data_set_default_bool(s, "studio_shadow_enabled", true)
+    obs.obs_data_set_default_int(s, "studio_shadow_blur", 40)
+    obs.obs_data_set_default_int(s, "studio_shadow_offset", 12)
+    obs.obs_data_set_default_int(s, "studio_shadow_opacity", 45)
 
     obs.obs_data_set_default_bool(s, "debug_logs", false)
 end
@@ -108,6 +122,19 @@ function M.read(s)
             only_inside = obs.obs_data_get_bool(s, "fx_only_inside"),
             only_zoomed = obs.obs_data_get_bool(s, "fx_only_zoomed"),
         },
+        studio = {
+            bg_type = obs.obs_data_get_string(s, "studio_bg_type"),
+            color1 = obs.obs_data_get_int(s, "studio_bg_color1"),
+            color2 = obs.obs_data_get_int(s, "studio_bg_color2"),
+            angle = obs.obs_data_get_int(s, "studio_bg_angle"),
+            image = obs.obs_data_get_string(s, "studio_bg_image"),
+            padding = geometry.clamp(obs.obs_data_get_double(s, "studio_padding"), 0, 30),
+            radius = math.max(0, obs.obs_data_get_int(s, "studio_radius")),
+            shadow_on = obs.obs_data_get_bool(s, "studio_shadow_enabled"),
+            shadow_blur = math.max(0, obs.obs_data_get_int(s, "studio_shadow_blur")),
+            shadow_offset = obs.obs_data_get_int(s, "studio_shadow_offset"),
+            shadow_opacity = geometry.clamp(obs.obs_data_get_int(s, "studio_shadow_opacity"), 0, 100) / 100,
+        },
         debug = obs.obs_data_get_bool(s, "debug_logs"),
     }
 end
@@ -135,7 +162,7 @@ end
 
 ---
 -- Build the properties panel
----@param ctx table {os, on_refresh, on_diagnose, on_help, on_fx_test}
+---@param ctx table {os, cfg, on_refresh, on_diagnose, on_help, on_fx_test, on_studio_apply, on_studio_remove}
 ---@return any props
 function M.properties(ctx)
     local props = obs.obs_properties_create()
@@ -244,6 +271,50 @@ function M.properties(ctx)
     end)
     obs.obs_property_set_long_description(test, "Play the sound and show a ripple at the current mouse position")
     obs.obs_properties_add_group(props, "grp_fx", "Click effects", obs.OBS_GROUP_NORMAL, fx)
+
+    -- Studio look
+    local studio = obs.obs_properties_create()
+    local st_type = obs.obs_properties_add_list(studio, "studio_bg_type", "Background",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(st_type, "Gradient", "gradient")
+    obs.obs_property_list_add_string(st_type, "Solid colour", "color")
+    obs.obs_property_list_add_string(st_type, "Image", "image")
+    local st_c1 = obs.obs_properties_add_color(studio, "studio_bg_color1", "Color ")
+    local st_c2 = obs.obs_properties_add_color(studio, "studio_bg_color2", "Second color ")
+    local st_angle = obs.obs_properties_add_int_slider(studio, "studio_bg_angle", "Gradient angle", 0, 360, 1)
+    local st_image = obs.obs_properties_add_path(studio, "studio_bg_image", "Background image ", obs.OBS_PATH_FILE,
+        "Images (*.png *.jpg *.jpeg *.webp *.bmp)", nil)
+    local function show_background(kind)
+        obs.obs_property_set_visible(st_c1, kind ~= "image")
+        obs.obs_property_set_visible(st_c2, kind == "gradient")
+        obs.obs_property_set_visible(st_angle, kind == "gradient")
+        obs.obs_property_set_visible(st_image, kind == "image")
+    end
+    show_background((cfg_now.studio and cfg_now.studio.bg_type) or "gradient")
+    obs.obs_property_set_modified_callback(st_type, function(_, _, settings)
+        show_background(obs.obs_data_get_string(settings, "studio_bg_type"))
+        return true
+    end)
+    local st_pad = obs.obs_properties_add_float_slider(studio, "studio_padding", "Padding (%)", 0, 30, 0.5)
+    obs.obs_property_set_long_description(st_pad, "Space around the picture, in percent of the shorter canvas side")
+    local st_rad = obs.obs_properties_add_int(studio, "studio_radius", "Corner radius (px)", 0, 200, 1)
+    obs.obs_property_set_long_description(st_rad, "In output pixels. 0 keeps the corners square")
+    obs.obs_properties_add_bool(studio, "studio_shadow_enabled", "Drop shadow ")
+    obs.obs_properties_add_int(studio, "studio_shadow_blur", "Shadow blur (px)", 0, 200, 1)
+    obs.obs_properties_add_int(studio, "studio_shadow_offset", "Shadow offset down (px)", -100, 100, 1)
+    obs.obs_properties_add_int_slider(studio, "studio_shadow_opacity", "Shadow opacity (%)", 0, 100, 1)
+    local st_apply = obs.obs_properties_add_button(studio, "studio_apply_button", "Apply studio look", function()
+        ctx.on_studio_apply()
+        return true
+    end)
+    obs.obs_property_set_long_description(st_apply, "Creates the \"OBSCineZoom Studio\" scene (your scene is not changed) " ..
+        "and switches to it. Press it again to rebuild. Changes to these settings then show up by themselves.")
+    local st_remove = obs.obs_properties_add_button(studio, "studio_remove_button", "Remove studio look", function()
+        ctx.on_studio_remove()
+        return true
+    end)
+    obs.obs_property_set_long_description(st_remove, "Switches back to your scene and deletes the studio scenes and images")
+    obs.obs_properties_add_group(props, "grp_studio", "Studio look", obs.OBS_GROUP_NORMAL, studio)
 
     -- Display override
     local override = obs.obs_properties_create()

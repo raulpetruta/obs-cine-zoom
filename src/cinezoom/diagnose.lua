@@ -1,5 +1,5 @@
 -- Diagnose: everything needed to debug a report, always logged (not gated by Debug).
--- Sections: Environment, Backend, Source, Displays, Live, Click effects, then a 5 second live probe.
+-- Sections: Environment, Backend, Source, Displays, Live, Click effects, Studio, then a 5 second live probe.
 local obs = obslua
 local log = require("cinezoom.log")
 local version = require("cinezoom.version")
@@ -113,6 +113,22 @@ local function fx_section(ctx, lines)
     end
 end
 
+local function studio_section(ctx, lines)
+    lines[#lines + 1] = "== Studio =="
+    if ctx.studio == nil then
+        lines[#lines + 1] = "not available"
+        return
+    end
+    local ok, studio_lines = pcall(ctx.studio.describe, ctx.studio, ctx.si)
+    if not ok then
+        lines[#lines + 1] = "could not describe the studio: " .. tostring(studio_lines)
+        return
+    end
+    for _, l in ipairs(studio_lines) do
+        lines[#lines + 1] = l
+    end
+end
+
 ---
 -- Build the report
 ---@param ctx table See main.lua (diagnose_context)
@@ -125,6 +141,7 @@ function M.report(ctx)
     displays_section(ctx, lines)
     live_section(ctx, lines)
     fx_section(ctx, lines)
+    studio_section(ctx, lines)
     return lines
 end
 

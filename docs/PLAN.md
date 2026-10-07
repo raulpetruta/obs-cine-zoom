@@ -232,7 +232,7 @@ Run with `luajit tests/run.lua`.
 ## L. Later milestones (not in this pass)
 
 - **M2, Lua overlays**: hide the system cursor in the capture settings and drive a script-owned cursor image with smoothing and scale; add a click ripple (an image source animated by scale and opacity).
-- **M3, Studio scene builder**: a background gradient or wallpaper, a padded nested "OBSCineZoom Canvas" scene, rounded corners via `mask_filter_v2` or obs-shaderfilter, and a drop shadow. Possibly a sub-pixel transform camera.
+- **M3, Studio scene builder**: implemented, see `docs/PLAN-studio.md` (a nested frame scene with `mask_filter_v2` rounded corners, a generated gradient and shadow, live updates). Needs verification on a Mac. A sub-pixel transform camera is still open.
 - **M4**: a JSON sidecar logging mouse, click and zoom events per recording, as input for a future editor.
 - **Native plugin**: motion blur, real cursor shapes, caret tracking via Accessibility, the Wayland pointer via PipeWire, and an openscreen-style post-recording editor.
 
