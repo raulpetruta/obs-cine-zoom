@@ -1,11 +1,14 @@
 name: release
 
 # Publishes a GitHub Release with cinezoom.lua attached, tagged v<M.VERSION>.
-# Run it from the Actions tab ("Run workflow"), or push a tag like v0.1.0.
+# Runs on every push to main (only publishes when that version has no release yet), from the
+# Actions tab ("Run workflow", which also refreshes the file of an existing release), or on a v* tag.
 # The README download button points at releases/latest/download/cinezoom.lua.
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -37,7 +40,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$TAG" > /dev/null 2>&1; then
-            # Release already exists: just replace the attached script
+            if [ "$GITHUB_REF_TYPE" = "branch" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "Release $TAG already exists; bump M.VERSION to publish a new one."
+              exit 0
+            fi
+            # Run by hand or from a tag: just replace the attached script
             gh release upload "$TAG" cinezoom.lua --clobber
           else
             gh release create "$TAG" cinezoom.lua \
